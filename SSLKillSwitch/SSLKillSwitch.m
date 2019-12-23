@@ -41,7 +41,7 @@ static BOOL shouldHookFromPreference(NSString *preferenceSetting)
 {
     BOOL shouldHook = NO;
     NSMutableDictionary* plist = [[NSMutableDictionary alloc] initWithContentsOfFile:PREFERENCE_FILE];
-    
+
     if (!plist)
     {
         SSKLog(@"Preference file not found.");
@@ -50,6 +50,21 @@ static BOOL shouldHookFromPreference(NSString *preferenceSetting)
     {
         shouldHook = [[plist objectForKey:preferenceSetting] boolValue];
         SSKLog(@"Preference set to %d.", shouldHook);
+
+        // Checking if BundleId has been excluded by user
+        NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
+        bundleId = [bundleId stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+
+        NSString *excludedBundleIdsString = [plist objectForKey:@"excludedBundleIds"];
+        excludedBundleIdsString = [excludedBundleIdsString stringByReplacingOccurrencesOfString:@" " withString:@""];
+
+        NSArray *excludedBundleIds = [excludedBundleIdsString componentsSeparatedByString:@","];
+
+        if ([excludedBundleIds containsObject:bundleId])
+        {
+            SSKLog(@"Not hooking excluded bundle: %@", bundleId);
+            shouldHook = NO;
+        }
     }
     return shouldHook;
 }
@@ -85,7 +100,7 @@ static SSLContextRef replaced_SSLCreateContext(CFAllocatorRef alloc,
                                                SSLConnectionType connectionType)
 {
     SSLContextRef sslContext = original_SSLCreateContext(alloc, protocolSide, connectionType);
-    
+
     // Immediately set the kSSLSessionOptionBreakOnServerAuth option in order to disable cert validation
     original_SSLSetSessionOption(sslContext, kSSLSessionOptionBreakOnServerAuth, true);
     return sslContext;
@@ -96,16 +111,16 @@ static OSStatus (*original_SSLHandshake)(SSLContextRef context);
 
 static OSStatus replaced_SSLHandshake(SSLContextRef context)
 {
-    
+
     OSStatus result = original_SSLHandshake(context);
-    
+
     // Hijack the flow when breaking on server authentication
     if (result == errSSLServerAuthCompleted)
     {
         // Do not check the cert and call SSLHandshake() again
         return original_SSLHandshake(context);
     }
-    
+
     return result;
 }
 
@@ -157,6 +172,15 @@ static void replaced_SSL_CTX_set_custom_verify(void *ctx, int mode, int (*callba
 }
 
 
+static void (*original_SSL_set_custom_verify)(void *ssl, int mode, int (*callback)(void *ssl, uint8_t *out_alert));
+static void replaced_SSL_set_custom_verify(void *ssl, int mode, int (*callback)(void *ssl, uint8_t *out_alert))
+{
+    SSKLog(@"Entering replaced_SSL_set_custom_verify()");
+    original_SSL_set_custom_verify(ssl, SSL_VERIFY_NONE, custom_verify_callback_that_does_not_validate);
+    return;
+}
+
+
 #pragma mark CocoaSPDY hook
 #if SUBSTRATE_BUILD
 
@@ -195,23 +219,41 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
     if (shouldHookFromPreference(PREFERENCE_KEY))
     {
         SSKLog(@"Substrate hook enabled.");
-        
+
         NSProcessInfo *processInfo = [NSProcessInfo processInfo];
         if ([processInfo isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){12, 0, 0}])
         {
-            // Support for iOS 12
-            SSKLog(@"iOS 12 detected; hooking SSL_CTX_set_custom_verify() and SSL_get_psk_identity()...");
-            
+            // Support for iOS 12 and 13
             void* boringssl_handle = dlopen("/usr/lib/libboringssl.dylib", RTLD_NOW);
-            void *SSL_CTX_set_custom_verify = dlsym(boringssl_handle, "SSL_CTX_set_custom_verify");
-            if (SSL_CTX_set_custom_verify)
+
+            if ([processInfo isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){13, 0, 0}])
             {
-                MSHookFunction((void *) SSL_CTX_set_custom_verify, (void *) replaced_SSL_CTX_set_custom_verify,  (void **) &original_SSL_CTX_set_custom_verify);
+                SSKLog(@"iOS 13 detected");
+                // iOS 13 uses SSL_set_custom_verify() which was recently added to BoringSSL
+                void *SSL_set_custom_verify = dlsym(boringssl_handle, "SSL_set_custom_verify");
+                if (SSL_set_custom_verify)
+                {
+                    SSKLog(@"Hooking SSL_set_custom_verify()...");
+                    MSHookFunction((void *) SSL_set_custom_verify, (void *) replaced_SSL_set_custom_verify,  (void **) &original_SSL_set_custom_verify);
+                }
+            }
+            else
+            {
+                SSKLog(@"iOS 12 detected");
+                // iOS 12 uses the older SSL_CTX_set_custom_verify()
+                void *SSL_CTX_set_custom_verify = dlsym(boringssl_handle, "SSL_CTX_set_custom_verify");
+                if (SSL_CTX_set_custom_verify)
+                {
+                    SSKLog(@"Hooking SSL_CTX_set_custom_verify()...");
+                    MSHookFunction((void *) SSL_CTX_set_custom_verify, (void *) replaced_SSL_CTX_set_custom_verify,  (void **) &original_SSL_CTX_set_custom_verify);
+                }
             }
             
+            // Hook SSL_get_psk_identity() on both iOS 12 and 13
             void *SSL_get_psk_identity = dlsym(boringssl_handle, "SSL_get_psk_identity");
             if (SSL_get_psk_identity)
             {
+                SSKLog(@"Hooking SSL_get_psk_identity()...");
                 MSHookFunction((void *) SSL_get_psk_identity, (void *) replaced_SSL_get_psk_identity,  (void **) NULL);
             }
         }
@@ -241,7 +283,7 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
             MSHookFunction((void *) SSLSetSessionOption,(void *)  replaced_SSLSetSessionOption, (void **) &original_SSLSetSessionOption);
             MSHookFunction((void *) SSLCreateContext,(void *)  replaced_SSLCreateContext, (void **) &original_SSLCreateContext);
         }
-        
+
         // CocoaSPDY hooks - https://github.com/twitter/CocoaSPDY
         // TODO: Enable these hooks for the fishhook-based hooking so it works on OS X too
         Class spdyProtocolClass = NSClassFromString(@"SPDYProtocol");
@@ -250,11 +292,11 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
             SSKLog(@"CocoaSPDY detected; hooking it...");
             // Disable trust evaluation
             MSHookMessageEx(object_getClass(spdyProtocolClass), NSSelectorFromString(@"setTLSTrustEvaluator:"), (IMP) &newSetTLSTrustEvaluator, (IMP *)&oldSetTLSTrustEvaluator);
-            
+
             // CocoaSPDY works by getting registered as a NSURLProtocol; block that so the Apps switches back to HTTP as SPDY is tricky to proxy
             Class spdyUrlConnectionProtocolClass = NSClassFromString(@"SPDYURLConnectionProtocol");
             MSHookMessageEx(object_getClass(spdyUrlConnectionProtocolClass), NSSelectorFromString(@"registerOrigin:"), (IMP) &newRegisterOrigin, (IMP *)&oldRegisterOrigin);
-            
+
             MSHookMessageEx(NSClassFromString(@"NSURLSessionConfiguration"), NSSelectorFromString(@"setprotocolClasses:"), (IMP) &newSetprotocolClasses, (IMP *)&oldSetprotocolClasses);
         }
     }
@@ -262,7 +304,7 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
     {
         SSKLog(@"Substrate hook disabled.");
     }
-    
+
 #else
     // Fishhook-based hooking, for OS X builds; always hook
     SSKLog(@"Fishhook hook enabled.");
@@ -271,19 +313,19 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
     {
         SSKLog(@"Hooking failed.");
     }
-    
+
     original_SSLSetSessionOption = dlsym(RTLD_DEFAULT, "SSLSetSessionOption");
     if ((rebind_symbols((struct rebinding[1]){{(char *)"SSLSetSessionOption", (void *)replaced_SSLSetSessionOption}}, 1) < 0))
     {
         SSKLog(@"Hooking failed.");
     }
-    
+
     original_SSLCreateContext = dlsym(RTLD_DEFAULT, "SSLCreateContext");
     if ((rebind_symbols((struct rebinding[1]){{(char *)"SSLCreateContext", (void *)replaced_SSLCreateContext}}, 1) < 0))
     {
         SSKLog(@"Hooking failed.");
     }
-    
+
     original_tls_helper_create_peer_trust = dlsym(RTLD_DEFAULT, "tls_helper_create_peer_trust");
     if ((rebind_symbols((struct rebinding[1]){{(char *)"tls_helper_create_peer_trust", (void *)replaced_tls_helper_create_peer_trust}}, 1) < 0))
     {
@@ -291,4 +333,3 @@ __attribute__((constructor)) static void init(int argc, const char **argv)
     }
 #endif
 }
-
